@@ -5,17 +5,24 @@
 #
 # REST API of a node (FastAPI): used by peers
 # for gossip, by the CLI, and later by the web
-# app (CORS is enabled for that purpose)
+# app (CORS is enabled for that purpose); also
+# serves the browser UI from proofchain/web at /ui
 ##################################################
+
+from pathlib import Path
 
 from fastapi import BackgroundTasks, Body, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from proofchain import __version__
 from proofchain.node import Node
 from proofchain.transaction import Transaction
 from proofchain.utils import ValidationError
+
+WEB_DIR = Path(__file__).parent / "web"
 
 
 class PeersIn(BaseModel):
@@ -113,5 +120,11 @@ def create_app(node: Node) -> FastAPI:
     @app.get("/validate")
     def validate():
         return {"valid": chain.is_valid(), "height": chain.height}
+
+    @app.get("/ui", include_in_schema=False)
+    def ui_redirect():
+        return RedirectResponse("/ui/")
+
+    app.mount("/ui", StaticFiles(directory=WEB_DIR, html=True), name="ui")
 
     return app

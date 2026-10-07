@@ -1,0 +1,120 @@
+<!doctype html>
+<!--
+author:   mrbacco <mrbacco04@gmail.com>
+date:     2026-10-07
+filename: proofchain/web/index.html
+
+ProofChain web UI: files are hashed and proofs
+are signed in the browser; only the hash and the
+signature are sent to the node
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ProofChain</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 1l7 7-7 7-7-7z' fill='%233b5bdb'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">◆</span>
+      <div>
+        <h1>ProofChain</h1>
+        <p>Prove who published a file, when, and that it is unchanged.</p>
+      </div>
+    </div>
+    <div class="status" id="node-status">
+      <span class="chip"><span class="dot" id="node-dot"></span><span id="node-label">connecting…</span></span>
+      <span class="chip">height <b id="stat-height">–</b></span>
+      <span class="chip">pending <b id="stat-pending">–</b></span>
+      <span class="chip">peers <b id="stat-peers">–</b></span>
+      <button id="mine-btn" class="secondary">Mine pending</button>
+    </div>
+  </header>
+
+  <main class="grid">
+    <!-- verify -->
+    <section class="card wide">
+      <h2>Verify a file</h2>
+      <p class="hint">Drop any file to check whether it is registered and untouched. Nothing is uploaded: the file is hashed in your browser.</p>
+      <div class="row">
+        <label class="drop" id="verify-drop">
+          <input type="file" id="verify-file">
+          <span class="drop-text" id="verify-drop-text">Drop a file here or click to choose</span>
+        </label>
+        <div class="or">or</div>
+        <form id="verify-hash-form" class="hash-form">
+          <input type="text" id="verify-hash" placeholder="paste a SHA3-256 hash" spellcheck="false" autocomplete="off">
+          <button type="submit" class="secondary">Check</button>
+        </form>
+      </div>
+      <div id="verify-result" class="result" hidden></div>
+    </section>
+
+    <!-- wallet -->
+    <section class="card">
+      <h2>Your wallet</h2>
+      <div id="wallet-empty">
+        <p class="hint">No wallet in this browser yet. Your key never leaves this device.</p>
+        <div class="buttons">
+          <button id="wallet-create">Create wallet</button>
+        </div>
+        <details>
+          <summary>Import an existing key</summary>
+          <p class="hint">Get it from the CLI with <code>python -m proofchain wallet export-key</code>.</p>
+          <form id="wallet-import-form" class="hash-form">
+            <input type="password" id="wallet-import-key" placeholder="64 hex characters" autocomplete="off">
+            <button type="submit" class="secondary">Import</button>
+          </form>
+        </details>
+      </div>
+      <div id="wallet-ready" hidden>
+        <p class="label">Address</p>
+        <p class="mono address" id="wallet-address"></p>
+        <div class="buttons">
+          <button id="wallet-copy" class="secondary">Copy address</button>
+          <button id="wallet-export" class="secondary">Show private key</button>
+          <button id="wallet-forget" class="danger">Forget</button>
+        </div>
+        <p class="mono secret" id="wallet-secret" hidden></p>
+        <p class="hint warn">The key is stored in this browser's local storage. Back it up: if it is lost, your proofs can no longer be revoked.</p>
+      </div>
+    </section>
+
+    <!-- register -->
+    <section class="card">
+      <h2>Register a file</h2>
+      <form id="register-form">
+        <label class="drop small" id="register-drop">
+          <input type="file" id="register-file">
+          <span class="drop-text" id="register-drop-text">Choose the original file</span>
+        </label>
+        <p class="mono hash-line" id="register-hash"></p>
+        <label class="field">Title <input type="text" id="register-title" maxlength="200" placeholder="optional"></label>
+        <label class="field">Note <input type="text" id="register-note" maxlength="500" placeholder="optional"></label>
+        <label class="check"><input type="checkbox" id="register-mine" checked> Mine a block right away</label>
+        <button type="submit" id="register-btn" disabled>Sign &amp; register</button>
+      </form>
+      <div id="register-result" class="result" hidden></div>
+    </section>
+
+    <!-- my proofs -->
+    <section class="card">
+      <h2>My proofs</h2>
+      <ul class="list" id="my-proofs"><li class="empty">Create or import a wallet to see your proofs.</li></ul>
+    </section>
+
+    <!-- blocks -->
+    <section class="card">
+      <h2>Latest blocks</h2>
+      <ul class="list" id="blocks"><li class="empty">Loading…</li></ul>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

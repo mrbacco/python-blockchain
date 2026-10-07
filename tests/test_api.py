@@ -84,3 +84,11 @@ def test_info_and_peers():
     assert client.post("/peers", json={"peers": ["127.0.0.1:5001/"]}).json()["peers"] == ["http://127.0.0.1:5001"]
     assert client.get("/blocks/0").json()["miner"] == "genesis"
     assert client.get("/blocks/9").status_code == 404
+
+
+def test_web_ui_is_served():
+    client, _ = make_client()
+    response = client.get("/ui", follow_redirects=True)
+    assert response.status_code == 200 and "ProofChain" in response.text
+    assert client.get("/ui/app.js").status_code == 200
+    assert client.get("/ui/style.css").status_code == 200

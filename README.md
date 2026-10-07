@@ -24,7 +24,7 @@ Only the hash goes on the chain. The file itself never leaves your machine.
 | Blocks | header with prev hash, Merkle root of the transactions, difficulty, nonce; SHA3-256 proof-of-work |
 | Consensus | gossip of transactions and blocks between peers; on a fork, the longest valid chain wins and transactions from abandoned blocks go back to the mempool |
 | Storage | each node saves its chain as JSON (atomic writes) and fully re-validates it from genesis on startup |
-| API | FastAPI REST API with CORS enabled, ready for the upcoming web app |
+| API | FastAPI REST API with CORS enabled, plus a browser UI at `/ui` |
 
 ```
 proofchain/
@@ -36,6 +36,7 @@ proofchain/
   node.py         peers, gossip, conflict resolution
   api.py          REST API
   cli.py          command line (python -m proofchain ...)
+  web/            browser UI served at /ui
 tests/            pytest suite
 legacy/           the original 2019 blockchain scripts
 ```
@@ -56,6 +57,18 @@ python -m proofchain mine
 python -m proofchain verify photo.jpg --node http://127.0.0.1:5001
 python -m proofchain revoke photo.jpg
 ```
+
+## Web UI
+
+Every node serves a browser UI at **http://127.0.0.1:5000/ui/**, where you can:
+
+- **Verify** a file by dropping it in, or by pasting a hash. The result is authentic, revoked, pending or not found.
+- **Wallet:** create a key or import one, then show or back it up. To use the same identity as the CLI, run `python -m proofchain wallet export-key` and import the result in the page. `wallet import-key` does the reverse.
+- **Register** a file with a title and a note, with an option to mine a block straight away.
+- **My proofs:** see all your proofs and revoke them.
+- **Latest blocks** and node status, with a button to mine pending transactions.
+
+Files are hashed (SHA3-256) and transactions are signed (secp256k1) **inside the browser**, using the audited [noble](https://paulmillr.com/noble/) libraries loaded from jsdelivr. Only the hash and the signature reach the node. The key is stored in the browser's local storage, so back it up.
 
 `verify` exits with code 1 when the file is not registered, so it can be used in scripts.
 

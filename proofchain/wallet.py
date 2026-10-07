@@ -50,6 +50,19 @@ class Wallet():
     def address(self) -> str:
         return address_from_public_key(self.public_key_hex)
 
+    @property
+    def private_key_hex(self) -> str:
+        # raw 32-byte secret, the format the web UI uses to import/export keys
+        return f"{self._private_key.private_numbers().private_value:064x}"
+
+    @classmethod
+    def from_private_key_hex(cls, private_key_hex: str) -> "Wallet":
+        try:
+            value = int(private_key_hex.strip().lower().removeprefix("0x"), 16)
+            return cls(ec.derive_private_key(value, CURVE))
+        except ValueError as exc:
+            raise ValueError("invalid private key: expected 64 hex characters") from exc
+
     def sign(self, data: bytes) -> str:
         return self._private_key.sign(data, ec.ECDSA(hashes.SHA256())).hex()
 

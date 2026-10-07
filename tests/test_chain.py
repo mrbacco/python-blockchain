@@ -197,3 +197,10 @@ def test_persistence_reloads_and_revalidates(tmp_path, alice):
     path.write_text(path.read_text().replace(content("photo"), content("forged")))
     with pytest.raises(ValidationError):
         Blockchain(DIFFICULTY, path)
+
+
+def test_private_key_hex_roundtrip(alice):
+    restored = Wallet.from_private_key_hex(alice.private_key_hex)
+    assert restored.address == alice.address
+    with pytest.raises(ValueError):
+        Wallet.from_private_key_hex("zz")

@@ -4,8 +4,8 @@
 # filename: proofchain/cli.py
 #
 # command line interface:
-#   node      run a node
-#   wallet    create / show a key pair
+#   node      run a node (web UI at /ui)
+#   wallet    create / show / export / import a key pair
 #   hash      sha3-256 of a file
 #   register  sign and submit a proof for a file
 #   revoke    withdraw one of your proofs
@@ -80,7 +80,7 @@ def cmd_node(args) -> None:
     if node.peers:
         node.resolve_conflicts()
         node.announce()
-    print(f"ProofChain node on {self_url} | chain {data} | height {node.chain.height} | peers {sorted(node.peers)}")
+    print(f"ProofChain node on {self_url} | web UI {self_url}/ui/ | chain {data} | height {node.chain.height} | peers {sorted(node.peers)}")
     uvicorn.run(create_app(node), host=args.host, port=args.port, log_level="warning")
 
 
@@ -101,6 +101,26 @@ def cmd_wallet_new(args) -> None:
 
 def cmd_wallet_show(args) -> None:
     wallet = _load_wallet(args)
+    _print({"address": wallet.address, "public_key": wallet.public_key_hex})
+
+
+def cmd_wallet_export(args) -> None:
+    wallet = _load_wallet(args)
+    print("private key (anyone holding it can sign as you, paste it only into your own browser):")
+    print(wallet.private_key_hex)
+
+
+def cmd_wallet_import(args) -> None:
+    try:
+        wallet = Wallet.from_private_key_hex(args.private_key or getpass.getpass("private key (hex): "))
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+    password = getpass.getpass("new wallet password: ") if args.password else None
+    try:
+        wallet.save(args.wallet, password)
+    except FileExistsError as exc:
+        sys.exit(f"error: {exc}")
+    print(f"wallet saved to {args.wallet}")
     _print({"address": wallet.address, "public_key": wallet.public_key_hex})
 
 
@@ -169,6 +189,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = wallet.add_parser("show", help="show address and public key")
     with_wallet(p)
     p.set_defaults(func=cmd_wallet_show)
+    p = wallet.add_parser("export-key", help="print the raw private key (for the web UI)")
+    with_wallet(p)
+    p.set_defaults(func=cmd_wallet_export)
+    p = wallet.add_parser("import-key", help="save a raw private key (e.g. from the web UI) as a wallet")
+    p.add_argument("private_key", nargs="?", help="64 hex chars (prompted if omitted)")
+    with_wallet(p)
+    p.set_defaults(func=cmd_wallet_import)
 
     p = sub.add_parser("hash", help="print the sha3-256 of a file")
     p.add_argument("file")

@@ -33,6 +33,9 @@ proofchain = "proofchain.cli:main"
 [tool.setuptools]
 packages = ["proofchain"]
 
+[tool.setuptools.package-data]
+proofchain = ["web/*"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
