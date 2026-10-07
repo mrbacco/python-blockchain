@@ -1,0 +1,15 @@
+##################################################
+# author:   mrbacco <mrbacco04@gmail.com>
+# date:     2026-10-07
+# filename: .gitignore
+##################################################
+
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+
+# node chain files and private keys must never be committed
+data/
+*.pem
