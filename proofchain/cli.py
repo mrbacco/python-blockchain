@@ -7,8 +7,10 @@
 #   node      run a node (web UI at /ui)
 #   wallet    create / show / export / import a key pair
 #   hash      sha3-256 of a file
+#   identity  publish / show the name behind an address
 #   register  sign and submit a proof for a file
 #   revoke    withdraw one of your proofs
+#   dispute   challenge someone else's proof
 #   verify    check a file against the chain
 #   mine      ask a node to mine pending proofs
 ##################################################
@@ -21,8 +23,10 @@ from pathlib import Path
 
 import httpx
 
-from proofchain.transaction import REGISTER, REVOKE, Transaction
-from proofchain.utils import hash_file, is_hex_digest
+from proofchain.identity import WELL_KNOWN_PATH, well_known_document
+from proofchain.perceptual import image_dhash
+from proofchain.transaction import DISPUTE, REGISTER, REVOKE, Transaction
+from proofchain.utils import ValidationError, hash_file, is_hex_digest
 from proofchain.wallet import Wallet
 
 DEFAULT_WALLET = Path.home() / ".proofchain" / "wallet.pem"
@@ -64,6 +68,24 @@ def _print(data) -> None:
     print(json.dumps(data, indent=2))
 
 
+def _who(identity: dict | None, address: str) -> str:
+    # "Name (verified: example.com)" or the bare address
+    if not identity:
+        return address
+    check = identity.get("domain_check")
+    if check and check["verified"]:
+        badge = f"verified: {identity['domain']}"
+    elif identity.get("domain"):
+        badge = f"NOT verified: {check['detail'] if check else identity['domain']}"
+    else:
+        badge = "self-declared, no domain"
+    return f"{identity['name']} ({badge}) {address}"
+
+
+def _submit(args, tx: Transaction) -> None:
+    _print(_request("POST", f"{args.node}/transactions", json=tx.to_dict()) | {"content_hash": tx.content_hash})
+
+
 def cmd_node(args) -> None:
     import logging
 
@@ -71,17 +93,21 @@ def cmd_node(args) -> None:
 
     from proofchain.api import create_app
     from proofchain.chain import Blockchain
+    from proofchain.identity import DomainVerifier
     from proofchain.node import Node
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     data = args.data or f"data/node-{args.port}.json"
     self_url = args.public_url or f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '::') else args.host}:{args.port}"
     node = Node(Blockchain(args.difficulty, data), miner=args.miner, self_url=self_url, peers=args.peers)
+    verifier = DomainVerifier(allow_insecure=args.insecure_identity)
+    if args.insecure_identity:
+        print("WARNING: insecure identity mode (plain http, local hosts allowed) - for local testing only")
     if node.peers:
         node.resolve_conflicts()
         node.announce()
     print(f"ProofChain node on {self_url} | web UI {self_url}/ui/ | chain {data} | height {node.chain.height} | peers {sorted(node.peers)}")
-    uvicorn.run(create_app(node), host=args.host, port=args.port, log_level="warning")
+    uvicorn.run(create_app(node, verifier), host=args.host, port=args.port, log_level="warning")
 
 
 def cmd_wallet_new(args) -> None:
@@ -128,19 +154,72 @@ def cmd_hash(args) -> None:
     print(hash_file(args.file))
 
 
+def cmd_identity_set(args) -> None:
+    wallet = _load_wallet(args)
+    try:
+        tx = Transaction.identity(wallet, args.name, args.domain)
+        tx.validate()
+    except ValidationError as exc:
+        sys.exit(f"error: {exc}")
+    _print(_request("POST", f"{args.node}/transactions", json=tx.to_dict()))
+    if args.domain:
+        print(f"\nto get verified, publish this file at https://{tx.metadata['domain']}{WELL_KNOWN_PATH}")
+        print("(it may list several addresses, e.g. one per team member):\n")
+        print(well_known_document([wallet.address]))
+
+
+def cmd_identity_show(args) -> None:
+    address = args.address or _load_wallet(args).address
+    try:
+        response = httpx.get(f"{args.node}/identities/{address}", timeout=30)
+    except httpx.HTTPError as exc:
+        sys.exit(f"error: cannot reach node: {exc}")
+    if response.status_code == 404:
+        sys.exit(f"{address} has not published an identity")
+    identity = response.json()
+    print(_who(identity, address))
+    _print(identity)
+
+
 def cmd_register(args) -> None:
     wallet = _load_wallet(args)
     metadata = {key: value for key, value in (("title", args.title), ("note", args.note)) if value}
+    perceptual_hash = None
     if Path(args.target).is_file():
         metadata.setdefault("filename", Path(args.target).name)
-    tx = Transaction.create(wallet, REGISTER, _content_hash(args.target), metadata)
-    _print(_request("POST", f"{args.node}/transactions", json=tx.to_dict()) | {"content_hash": tx.content_hash})
+        if not args.no_perceptual:
+            perceptual_hash = image_dhash(args.target)
+    derived_from = _content_hash(args.derived_from) if args.derived_from else None
+    tx = Transaction.create(wallet, REGISTER, _content_hash(args.target), metadata,
+                            perceptual_hash=perceptual_hash, derived_from=derived_from)
+    _submit(args, tx)
 
 
 def cmd_revoke(args) -> None:
     wallet = _load_wallet(args)
-    tx = Transaction.create(wallet, REVOKE, _content_hash(args.target))
-    _print(_request("POST", f"{args.node}/transactions", json=tx.to_dict()) | {"content_hash": tx.content_hash})
+    _submit(args, Transaction.create(wallet, REVOKE, _content_hash(args.target)))
+
+
+def cmd_dispute(args) -> None:
+    wallet = _load_wallet(args)
+    evidence = _content_hash(args.evidence) if args.evidence else None
+    tx = Transaction.create(wallet, DISPUTE, _content_hash(args.target), {"reason": args.reason}, evidence=evidence)
+    _submit(args, tx)
+
+
+def _print_similar(args) -> None:
+    perceptual_hash = image_dhash(args.target) if Path(args.target).is_file() else None
+    if not perceptual_hash:
+        return
+    matches = _request("GET", f"{args.node}/similar/{perceptual_hash}")["matches"]
+    if not matches:
+        print("no similar registered images either")
+        return
+    print(f"\nbut {len(matches)} registered image(s) look similar (possibly an edited or re-encoded copy):")
+    for match in matches:
+        print(f"  {match['distance']:>2}/64 bits differ  {match['status']:<9} "
+              f"{match['metadata'].get('title') or match['metadata'].get('filename', '')}  "
+              f"by {_who(match['owner_identity'], match['owner'])}")
 
 
 def cmd_verify(args) -> None:
@@ -151,9 +230,17 @@ def cmd_verify(args) -> None:
         sys.exit(f"error: cannot reach node: {exc}")
     if response.status_code == 404:
         print(f"NOT FOUND: no proof for {content_hash} (unregistered, or the file was modified)")
+        _print_similar(args)
         sys.exit(1)
     record = response.json()
-    print(f"{record['status'].upper()}: registered by {record['owner']}")
+    print(f"{record['status'].upper()}: registered by {_who(record['owner_identity'], record['owner'])}")
+    if record.get("derived_from"):
+        original = record.get("derived_from_record")
+        print(f"derived from original {record['derived_from'][:16]}... "
+              + (f"registered {original['timestamp']} ({original['status']})" if original else "(not found)"))
+    for dispute in record["disputes"]:
+        evidence = f", evidence registered at {dispute['evidence_timestamp']}" if dispute["evidence"] else ""
+        print(f"DISPUTED by {_who(dispute['disputer_identity'], dispute['disputer'])}: {dispute['reason']}{evidence}")
     _print(record)
 
 
@@ -180,6 +267,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--miner", default="node", help="label/address recorded in mined blocks")
     p.add_argument("--peers", nargs="*", default=[], help="peer node urls")
     p.add_argument("--public-url", help="url peers use to reach this node")
+    p.add_argument("--insecure-identity", action="store_true",
+                   help="verify identity domains over plain http, including local hosts (testing only)")
     p.set_defaults(func=cmd_node)
 
     wallet = sub.add_parser("wallet", help="manage your key pair").add_subparsers(dest="wallet_command", required=True)
@@ -197,6 +286,20 @@ def build_parser() -> argparse.ArgumentParser:
     with_wallet(p)
     p.set_defaults(func=cmd_wallet_import)
 
+    identity = sub.add_parser("identity", help="publish / show the name behind an address").add_subparsers(
+        dest="identity_command", required=True)
+    p = identity.add_parser("set", help="publish your name, optionally with a domain that vouches for it")
+    p.add_argument("--name", required=True)
+    p.add_argument("--domain", help="e.g. example.com (verified via /.well-known/proofchain.json)")
+    with_wallet(p)
+    with_node(p)
+    p.set_defaults(func=cmd_identity_set)
+    p = identity.add_parser("show", help="show the identity of an address (default: your wallet)")
+    p.add_argument("address", nargs="?")
+    with_wallet(p)
+    with_node(p)
+    p.set_defaults(func=cmd_identity_show)
+
     p = sub.add_parser("hash", help="print the sha3-256 of a file")
     p.add_argument("file")
     p.set_defaults(func=cmd_hash)
@@ -205,6 +308,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("target", help="file path or sha3-256 hex digest")
     p.add_argument("--title")
     p.add_argument("--note")
+    p.add_argument("--derived-from", metavar="ORIGINAL",
+                   help="file or hash of your earlier registered original (e.g. the unpublished RAW)")
+    p.add_argument("--no-perceptual", action="store_true", help="do not attach a perceptual hash for images")
     with_wallet(p)
     with_node(p)
     p.set_defaults(func=cmd_register)
@@ -214,6 +320,14 @@ def build_parser() -> argparse.ArgumentParser:
     with_wallet(p)
     with_node(p)
     p.set_defaults(func=cmd_revoke)
+
+    p = sub.add_parser("dispute", help="challenge someone else's proof")
+    p.add_argument("target", help="file path or sha3-256 hex digest of the disputed proof")
+    p.add_argument("--reason", required=True)
+    p.add_argument("--evidence", help="file or hash of your own earlier registration backing the claim")
+    with_wallet(p)
+    with_node(p)
+    p.set_defaults(func=cmd_dispute)
 
     p = sub.add_parser("verify", help="check a file or hash against the chain")
     p.add_argument("target", help="file path or sha3-256 hex digest")
@@ -228,6 +342,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # names and titles may contain any character; never crash on a legacy console encoding
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     args = build_parser().parse_args(argv)
     if hasattr(args, "node") and isinstance(args.node, str):
         args.node = args.node.rstrip("/")

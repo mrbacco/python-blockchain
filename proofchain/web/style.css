@@ -172,3 +172,23 @@ details .hash-form { margin-top: 8px; }
   box-shadow: 0 6px 24px rgba(0, 0, 0, .25);
 }
 .toast.error { background: var(--bad); color: #fff; }
+
+/* trust features */
+.subhead { font-size: 14px; margin: 20px 0 4px; padding-top: 16px; border-top: 1px solid var(--border); }
+.snippet { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; padding: 10px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border); }
+select {
+  font: inherit; width: 100%; margin-top: 4px; padding: 8px 10px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+}
+.badge.verified { background: var(--ok-bg); color: var(--ok); }
+.badge.unverified { background: var(--warn-bg); color: var(--warn); }
+.badge.declared { background: var(--none-bg); color: var(--muted); }
+.badge.disputed { background: var(--bad-bg); color: var(--bad); }
+.who { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.who .addr { color: var(--muted); }
+.identity-box { padding: 10px 12px; border-radius: 8px; background: var(--none-bg); margin-bottom: 8px; font-size: 14px; }
+.sublist { list-style: none; margin: 12px 0 0; padding: 0; }
+.sublist li { padding: 10px 12px; margin-top: 8px; border-radius: 8px; background: var(--card); border: 1px solid var(--border); font-size: 14px; }
+.sublist .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.sublist .strong { color: var(--bad); font-weight: 600; }
+.result .actions { margin-top: 12px; }

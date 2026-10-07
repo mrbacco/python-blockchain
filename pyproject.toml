@@ -25,7 +25,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+images = ["Pillow>=10"]  # perceptual hashes for images in the CLI
+dev = ["pytest>=8", "Pillow>=10"]
 
 [project.scripts]
 proofchain = "proofchain.cli:main"

@@ -11,26 +11,51 @@
 
 from pathlib import Path
 
-from fastapi import BackgroundTasks, Body, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Query
+from fastapi import Path as Path_
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from proofchain import __version__
+from proofchain.identity import DomainVerifier
 from proofchain.node import Node
+from proofchain.perceptual import SIMILAR_DISTANCE
 from proofchain.transaction import Transaction
 from proofchain.utils import ValidationError
 
 WEB_DIR = Path(__file__).parent / "web"
+PERCEPTUAL_HASH_PATTERN = r"^[0-9a-fA-F]{16}$"
 
 
 class PeersIn(BaseModel):
     peers: list[str]
 
 
-def create_app(node: Node) -> FastAPI:
+def create_app(node: Node, verifier: DomainVerifier | None = None) -> FastAPI:
     chain = node.chain
+    verifier = verifier or DomainVerifier()
+
+    def describe_identity(address: str) -> dict | None:
+        # on-chain identity plus a live (cached) check of its domain
+        identity = chain.identity(address)
+        if identity is None:
+            return None
+        check = verifier.check(identity.domain, address).to_dict() if identity.domain else None
+        return {**identity.to_dict(), "domain_check": check}
+
+    def describe_proof(status: str, record) -> dict:
+        data = {"status": status, **record.to_dict(), "owner_identity": describe_identity(record.owner)}
+        for dispute in data["disputes"]:
+            dispute["disputer_identity"] = describe_identity(dispute["disputer"])
+        if record.derived_from:
+            original = chain.lookup(record.derived_from)
+            data["derived_from_record"] = (
+                {"status": original[0], "timestamp": original[1].timestamp, "metadata": original[1].metadata}
+                if original else None
+            )
+        return data
     app = FastAPI(title="ProofChain node", version=__version__)
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -97,12 +122,32 @@ def create_app(node: Node) -> FastAPI:
         found = chain.lookup(content_hash)
         if found is None:
             raise HTTPException(404, "no proof registered for this content hash")
-        status, record = found
-        return {"status": status, **record.to_dict()}
+        return describe_proof(*found)
+
+    @app.get("/similar/{perceptual_hash}")
+    def get_similar(perceptual_hash: str = Path_(pattern=PERCEPTUAL_HASH_PATTERN),
+                    max_distance: int = Query(SIMILAR_DISTANCE, ge=0, le=32)):
+        # registered images that look like the given one (resized, re-encoded, lightly edited)
+        matches = chain.similar(perceptual_hash.lower(), max_distance)
+        return {"matches": [
+            {"distance": distance, **describe_proof("revoked" if record.revoked else "confirmed", record)}
+            for distance, record in matches
+        ]}
 
     @app.get("/owners/{address}/proofs")
     def get_owner_proofs(address: str):
-        return {"address": address, "proofs": [record.to_dict() for record in chain.proofs_by_owner(address)]}
+        return {
+            "address": address,
+            "identity": describe_identity(address),
+            "proofs": [record.to_dict() for record in chain.proofs_by_owner(address)],
+        }
+
+    @app.get("/identities/{address}")
+    def get_identity(address: str):
+        identity = describe_identity(address)
+        if identity is None:
+            raise HTTPException(404, "this address has not published an identity")
+        return identity
 
     @app.get("/peers")
     def get_peers():

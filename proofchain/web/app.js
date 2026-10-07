@@ -41,7 +41,7 @@ function el(tag, props = {}, ...children) {
     else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
     else node.setAttribute(key, value);
   }
-  for (const child of children) if (child != null) node.append(child);
+  for (const child of children) if (child != null && child !== false) node.append(child);
   return node;
 }
 
@@ -94,6 +94,58 @@ async function hashFile(file, onProgress) {
   return toHex(hasher.digest());
 }
 
+// perceptual hash "dhash-v1", same algorithm as proofchain/perceptual.py:
+// EXIF-oriented image -> integer luminance per pixel (Pillow "L" formula) ->
+// exact area-average of the full-resolution values to 9x8 (no intermediate
+// resize, so browsers and Pillow agree) ->
+// bit = pixel brighter than its right neighbour -> 16 hex chars
+const GRID_W = 9, GRID_H = 8, MAX_PIXELS = 40_000_000, TIE_MARGIN = 0.1, SIMILAR_DISTANCE = 10;
+
+async function imageDhash(file) {
+  if (!file.type.startsWith("image/")) return null;
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+  } catch {
+    return null; // not decodable by this browser
+  }
+  let w = bitmap.width, h = bitmap.height;
+  while (w * h > MAX_PIXELS) { w = Math.floor(w / 2); h = Math.floor(h / 2); } // like Pillow reduce(2)
+  const canvas = new OffscreenCanvas(w, h);
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  bitmap.close();
+  const { data } = ctx.getImageData(0, 0, w, h);
+  const luminance = new Uint8Array(w * h);
+  for (let i = 0, j = 0; j < luminance.length; i += 4, j++) {
+    luminance[j] = (19595 * data[i] + 38470 * data[i + 1] + 7471 * data[i + 2] + 32768) >> 16;
+  }
+
+  // exact area averaging (like Pillow's BOX filter) with fractional pixel coverage
+  const grid = [];
+  for (let gy = 0; gy < GRID_H; gy++) {
+    const row = [];
+    const y0 = (gy * h) / GRID_H, y1 = ((gy + 1) * h) / GRID_H;
+    for (let gx = 0; gx < GRID_W; gx++) {
+      const x0 = (gx * w) / GRID_W, x1 = ((gx + 1) * w) / GRID_W;
+      let sum = 0, area = 0;
+      for (let y = Math.floor(y0); y < Math.ceil(y1); y++) {
+        const wy = Math.min(y + 1, y1) - Math.max(y, y0);
+        for (let x = Math.floor(x0); x < Math.ceil(x1); x++) {
+          const weight = wy * (Math.min(x + 1, x1) - Math.max(x, x0));
+          sum += weight * luminance[y * w + x];
+          area += weight;
+        }
+      }
+      row.push(sum / area);
+    }
+    grid.push(row);
+  }
+  let bits = "";
+  for (const row of grid) for (let x = 0; x < GRID_W - 1; x++) bits += row[x] - row[x + 1] > TIE_MARGIN ? "1" : "0";
+  return BigInt("0b" + bits).toString(16).padStart(16, "0");
+}
+
 // DER encoding of an ECDSA (r, s) pair, the format Python's cryptography verifies
 function derInteger(value) {
   let hex = value.toString(16);
@@ -143,7 +195,9 @@ const wallet = {
   },
 };
 
-async function buildTransaction(txType, contentHash, metadata = {}) {
+// optional: { perceptual_hash, derived_from, evidence } - only included when set,
+// exactly like the Python Transaction.payload()
+async function buildTransaction(txType, contentHash, metadata = {}, optional = {}) {
   const payload = {
     tx_type: txType,
     content_hash: contentHash,
@@ -151,8 +205,93 @@ async function buildTransaction(txType, contentHash, metadata = {}) {
     timestamp: Date.now(),
     metadata,
   };
+  for (const [key, value] of Object.entries(optional)) if (value) payload[key] = value;
   const signature = await wallet.sign(new TextEncoder().encode(canonicalJson(payload)));
   return { ...payload, signature };
+}
+
+// ---------------------------------------------------------------- identity
+
+function identityBadge(identity) {
+  if (!identity) return null;
+  const check = identity.domain_check;
+  if (check?.verified) return el("span", { class: "badge verified", text: `✓ ${identity.domain}`, title: check.detail });
+  if (identity.domain) return el("span", { class: "badge unverified", text: "unverified", title: check?.detail ?? "" });
+  return el("span", { class: "badge declared", text: "self-declared", title: "no domain vouches for this name" });
+}
+
+// "Name [✓ domain] [you] pc1234…" or just the address
+function who(identity, address) {
+  const isMe = wallet.privateKey && address === wallet.address;
+  return el("span", { class: "who" },
+    identity ? el("b", { text: identity.name }) : null,
+    identityBadge(identity),
+    isMe ? el("span", { class: "badge you", text: "you" }) : null,
+    el("span", { class: identity ? "mono addr" : "mono", text: identity ? short(address, 8) : address, title: address }),
+  );
+}
+
+let identityFormDirty = false;
+
+function renderIdentity(identity) {
+  const box = $("identity-current");
+  if (!identity) {
+    box.replaceChildren(el("p", { class: "hint", text: "No identity published yet." }));
+  } else {
+    const check = identity.domain_check;
+    box.replaceChildren(el("div", { class: "identity-box" },
+      who(identity, wallet.address),
+      check && !check.verified ? el("div", { class: "item-sub", text: check.detail }) : null,
+      identity.block_index < 0 ? el("div", { class: "item-sub", text: "pending: waiting to be mined" }) : null,
+    ));
+    if (!identityFormDirty) {
+      $("identity-name").value = identity.name;
+      $("identity-domain").value = identity.domain ?? "";
+    }
+  }
+  const domain = identity?.domain;
+  $("identity-howto").hidden = !domain || Boolean(identity.domain_check?.verified);
+  if (domain) {
+    $("identity-url").textContent = `https://${domain}/.well-known/proofchain.json`;
+    $("identity-snippet").textContent = JSON.stringify({ addresses: [wallet.address] }, null, 2);
+  }
+}
+
+for (const id of ["identity-name", "identity-domain"]) $(id).addEventListener("input", () => (identityFormDirty = true));
+
+$("identity-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const name = $("identity-name").value.trim();
+  const domain = $("identity-domain").value.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+  const metadata = domain ? { name, domain } : { name };
+  const button = $("identity-btn");
+  button.disabled = true;
+  try {
+    const tx = await buildTransaction("identity", "", metadata);
+    await api("/transactions", { method: "POST", body: JSON.stringify(tx) });
+    await api("/mine", { method: "POST" });
+    identityFormDirty = false;
+    toast(domain ? "Identity published. Now publish the file shown below on your domain." : "Identity published.");
+  } catch (error) {
+    toast(`Could not publish identity: ${error.message}`, true);
+  } finally {
+    button.disabled = false;
+    refreshAll();
+  }
+});
+
+function renderDerivedOptions(proofs) {
+  const select = $("register-derived");
+  const current = select.value;
+  const options = proofs
+    .filter((proof) => !proof.revoked)
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .map((proof) => el("option", {
+      value: proof.content_hash,
+      text: `${proof.metadata.title || proof.metadata.filename || "untitled"} · ${short(proof.content_hash, 6)}`,
+    }));
+  select.replaceChildren(el("option", { value: "", text: "— none: this is an original —" }), ...options);
+  if ([...select.options].some((option) => option.value === current)) select.value = current;
 }
 
 // ------------------------------------------------------------------ status
@@ -198,10 +337,12 @@ async function refreshMyProofs() {
     return;
   }
   try {
-    const [{ proofs }, { transactions }] = await Promise.all([
+    const [{ proofs, identity }, { transactions }] = await Promise.all([
       api(`/owners/${wallet.address}/proofs`),
       api("/mempool"),
     ]);
+    renderIdentity(identity);
+    renderDerivedOptions(proofs);
     const mine = transactions.filter((tx) => tx.public_key === wallet.publicKey);
     const pendingRevokes = new Set(mine.filter((tx) => tx.tx_type === "revoke").map((tx) => tx.content_hash));
     const pendingRegisters = mine
@@ -225,9 +366,12 @@ async function refreshMyProofs() {
         const revoke = item.status === "confirmed"
           ? el("button", { class: "danger", text: "Revoke", onclick: () => revokeProof(item.content_hash, name) })
           : null;
+        const disputed = item.disputes?.length
+          ? el("span", { class: "badge disputed", text: `disputed ×${item.disputes.length}` })
+          : null;
         return el("li", {},
           el("div", { class: "item-main" },
-            el("div", { class: "item-title" }, `${name} `, el("span", { class: `badge ${item.status}`, text: item.status })),
+            el("div", { class: "item-title" }, `${name} `, el("span", { class: `badge ${item.status}`, text: item.status }), " ", disputed),
             el("div", { class: "item-sub mono", text: short(item.content_hash, 16) }),
             el("div", { class: "item-sub", text: formatTime(item.timestamp) }),
           ),
@@ -253,6 +397,11 @@ function renderWallet() {
   $("wallet-secret").hidden = true;
   $("wallet-export").textContent = "Show private key";
   if (ready) $("wallet-address").textContent = wallet.address;
+  identityFormDirty = false;
+  $("identity-name").value = "";
+  $("identity-domain").value = "";
+  $("identity-current").replaceChildren();
+  $("identity-howto").hidden = true;
   updateRegisterButton();
 }
 
@@ -303,6 +452,37 @@ $("wallet-forget").addEventListener("click", () => {
 
 // ------------------------------------------------------------------ verify
 
+let lastVerified = null; // { contentHash, file } so the result can be refreshed after a dispute
+
+function proofName(proof) {
+  return proof.metadata.title || proof.metadata.filename || short(proof.content_hash, 8);
+}
+
+function renderDisputes(proof) {
+  if (!proof.disputes?.length) return null;
+  return el("div", {},
+    el("h3", { class: "subhead", text: `Disputed by ${proof.disputes.length} ${proof.disputes.length === 1 ? "party" : "parties"}` }),
+    el("ul", { class: "sublist" }, ...proof.disputes.map((dispute) => {
+      let evidence = null;
+      if (dispute.evidence) {
+        const earlier = dispute.evidence_timestamp < proof.timestamp;
+        evidence = el("div", { class: "meta" },
+          "Evidence: their own registration from ",
+          el("span", { class: earlier ? "strong" : "", text: formatTime(dispute.evidence_timestamp) }),
+          earlier ? el("span", { class: "strong", text: " — earlier than this claim" }) : " — later than this claim",
+          el("span", { class: "mono", text: ` (${short(dispute.evidence, 8)})` }),
+        );
+      }
+      return el("li", {},
+        who(dispute.disputer_identity, dispute.disputer),
+        el("div", { text: `“${dispute.reason}”` }),
+        el("div", { class: "meta", text: `${formatTime(dispute.timestamp)} · ${dispute.block_index >= 0 ? `block #${dispute.block_index}` : "pending"}` }),
+        evidence,
+      );
+    })),
+  );
+}
+
 function showVerifyResult(contentHash, proof) {
   const box = $("verify-result");
   box.hidden = false;
@@ -310,36 +490,91 @@ function showVerifyResult(contentHash, proof) {
     box.className = "result";
     box.replaceChildren(
       el("h3", { text: "Not found" }),
-      el("p", { class: "hint", text: "No proof exists for this content. Either it was never registered, or the file has been modified." }),
+      el("p", { class: "hint", text: "No proof exists for this exact content. Either it was never registered, or the file has been modified." }),
       el("dl", {}, el("dt", { text: "SHA3-256" }), el("dd", { class: "mono", text: contentHash })),
+      el("div", { id: "similar-results" }),
     );
     return;
   }
-  const titles = { confirmed: "Authentic: registered and unchanged", revoked: "Revoked by its owner", pending: "Pending: waiting to be mined" };
-  const classes = { confirmed: "ok", revoked: "bad", pending: "warn" };
-  const isMine = wallet.privateKey && proof.owner === wallet.address;
+  const disputed = proof.status === "confirmed" && proof.disputes.length > 0;
+  const titles = {
+    confirmed: disputed ? "Registered and unchanged — but disputed" : "Authentic: registered and unchanged",
+    revoked: "Revoked by its owner",
+    pending: "Pending: waiting to be mined",
+  };
+  const classes = { confirmed: disputed ? "warn" : "ok", revoked: "bad", pending: "warn" };
   const rows = [
-    ["Owner", el("span", { class: "mono" }, proof.owner, isMine ? " " : null, isMine ? el("span", { class: "badge you", text: "you" }) : null)],
+    ["Owner", who(proof.owner_identity, proof.owner)],
     ["Registered", formatTime(proof.timestamp)],
     ["Block", proof.block_index >= 0 ? `#${proof.block_index}` : "not yet mined"],
+  ];
+  if (proof.revoked) rows.push(["Revoked", formatTime(proof.revoked_at)]);
+  if (proof.derived_from) {
+    const original = proof.derived_from_record;
+    rows.push(["Derived from", el("span", {},
+      original ? `original registered ${formatTime(original.timestamp)} by the same owner ` : "original not found ",
+      el("span", { class: "mono", text: `(${short(proof.derived_from, 8)})` }),
+    )]);
+  }
+  rows.push(
     ...Object.entries(proof.metadata).map(([key, value]) => [key[0].toUpperCase() + key.slice(1), value]),
     ["SHA3-256", el("span", { class: "mono", text: proof.content_hash })],
     ["Transaction", el("span", { class: "mono", text: proof.tx_id })],
-  ];
-  if (proof.revoked) rows.splice(3, 0, ["Revoked", formatTime(proof.revoked_at)]);
+  );
+
+  const canDispute = wallet.privateKey && proof.status === "confirmed" && proof.owner !== wallet.address
+    && !proof.disputes.some((dispute) => dispute.disputer === wallet.address);
   box.className = `result ${classes[proof.status]}`;
-  box.replaceChildren(
+  box.replaceChildren(...[
     el("h3", { text: titles[proof.status] }),
     el("dl", {}, ...rows.flatMap(([label, value]) => [el("dt", { text: label }), el("dd", {}, value)])),
+    renderDisputes(proof),
+    canDispute ? el("div", { class: "actions" },
+      el("button", { class: "danger", text: "Dispute this claim", onclick: () => disputeProof(proof) })) : null,
+  ].filter(Boolean)); // replaceChildren would render null as the text "null"
+}
+
+async function showSimilar(file) {
+  const target = document.getElementById("similar-results");
+  if (!target) return;
+  const perceptualHash = await imageDhash(file);
+  if (!perceptualHash) return;
+  let matches;
+  try {
+    ({ matches } = await api(`/similar/${perceptualHash}?max_distance=${SIMILAR_DISTANCE}`));
+  } catch {
+    return;
+  }
+  if (!matches.length) {
+    target.replaceChildren(el("p", { class: "hint", text: "No similar registered images either." }));
+    return;
+  }
+  const box = $("verify-result");
+  box.className = "result warn";
+  box.querySelector("h3").textContent = "Not an exact match — but similar registered images exist";
+  target.replaceChildren(
+    el("p", { class: "hint", text: "This may be a resized, re-compressed or edited copy of:" }),
+    el("ul", { class: "sublist" }, ...matches.map((match) => el("li", {},
+      el("div", {}, el("b", { text: proofName(match) }), " ",
+        el("span", { class: `badge ${match.status}`, text: match.status }), " ",
+        el("span", { class: "badge declared", text: `${Math.round((1 - match.distance / 64) * 100)}% similar` })),
+      el("div", {}, "by ", who(match.owner_identity, match.owner)),
+      el("div", { class: "meta", text: `registered ${formatTime(match.timestamp)}` }),
+    ))),
   );
 }
 
-async function verifyHash(contentHash) {
+async function verifyHash(contentHash, file = null) {
+  lastVerified = { contentHash, file };
   try {
     showVerifyResult(contentHash, await api(`/proofs/${contentHash}`));
   } catch (error) {
-    if (error.status === 404) showVerifyResult(contentHash, null);
-    else toast(`Verification failed: ${error.message}`, true);
+    if (error.status !== 404) {
+      toast(`Verification failed: ${error.message}`, true);
+      return;
+    }
+    showVerifyResult(contentHash, null);
+    if (file) await showSimilar(file);
   }
 }
 
@@ -349,11 +584,34 @@ async function verifyFile(file) {
   try {
     const contentHash = await hashFile(file, (p) => (label.textContent = `Hashing ${file.name}… ${Math.round(p * 100)}%`));
     label.textContent = `${file.name} — drop another file to check it`;
-    await verifyHash(contentHash);
+    await verifyHash(contentHash, file);
   } catch (error) {
     label.textContent = "Drop a file here or click to choose";
     toast(`Could not read the file: ${error.message}`, true);
   }
+}
+
+async function disputeProof(proof) {
+  const reason = prompt(`Why do you dispute "${proofName(proof)}"? (visible to everyone)`);
+  if (!reason?.trim()) return;
+  const evidence = prompt(
+    "Optional evidence: the SHA3-256 hash of YOUR OWN earlier registration (e.g. your original RAW file). Leave empty for none.",
+    "",
+  )?.trim().toLowerCase();
+  if (evidence && !isHash(evidence)) {
+    toast("Evidence must be a 64-character SHA3-256 hash.", true);
+    return;
+  }
+  try {
+    const tx = await buildTransaction("dispute", proof.content_hash, { reason: reason.trim() }, { evidence });
+    await api("/transactions", { method: "POST", body: JSON.stringify(tx) });
+    await api("/mine", { method: "POST" });
+    toast("Dispute recorded on the chain.");
+  } catch (error) {
+    toast(`Dispute failed: ${error.message}`, true);
+  }
+  if (lastVerified) await verifyHash(lastVerified.contentHash, lastVerified.file);
+  refreshAll();
 }
 
 $("verify-file").addEventListener("change", (event) => {
@@ -376,6 +634,7 @@ $("verify-hash-form").addEventListener("submit", (event) => {
 
 let registerFile = null;
 let registerHash = null;
+let registerPerceptual = null;
 
 function updateRegisterButton() {
   const button = $("register-btn");
@@ -386,12 +645,16 @@ function updateRegisterButton() {
 async function selectRegisterFile(file) {
   registerFile = file;
   registerHash = null;
+  registerPerceptual = null;
+  $("register-phash").textContent = "";
   updateRegisterButton();
   $("register-drop-text").textContent = file.name;
   $("register-hash").textContent = "hashing…";
   try {
     registerHash = await hashFile(file, (p) => ($("register-hash").textContent = `hashing… ${Math.round(p * 100)}%`));
     $("register-hash").textContent = `SHA3-256 ${registerHash}`;
+    registerPerceptual = await imageDhash(file);
+    if (registerPerceptual) $("register-phash").textContent = `perceptual ${registerPerceptual} (finds edited copies)`;
   } catch (error) {
     $("register-hash").textContent = "";
     toast(`Could not read the file: ${error.message}`, true);
@@ -419,7 +682,10 @@ $("register-form").addEventListener("submit", async (event) => {
   button.disabled = true;
   button.textContent = "Signing…";
   try {
-    const tx = await buildTransaction("register", registerHash, metadata);
+    const tx = await buildTransaction("register", registerHash, metadata, {
+      perceptual_hash: registerPerceptual,
+      derived_from: $("register-derived").value,
+    });
     await api("/transactions", { method: "POST", body: JSON.stringify(tx) });
     let message = "Proof submitted. It is pending until a block is mined.";
     if ($("register-mine").checked) {
@@ -434,7 +700,9 @@ $("register-form").addEventListener("submit", async (event) => {
     $("register-note").value = "";
     $("register-drop-text").textContent = "Choose the original file";
     $("register-hash").textContent = "";
-    registerFile = registerHash = null;
+    $("register-phash").textContent = "";
+    $("register-derived").value = "";
+    registerFile = registerHash = registerPerceptual = null;
   } catch (error) {
     result.className = "result bad";
     result.replaceChildren(el("h3", { text: "Not registered" }), el("p", { text: error.message }));
@@ -499,3 +767,6 @@ wallet.load();
 renderWallet();
 refreshAll();
 setInterval(refreshAll, REFRESH_MS);
+
+// exported for tooling and tests (e.g. comparing with the Python implementation)
+export { canonicalJson, imageDhash };

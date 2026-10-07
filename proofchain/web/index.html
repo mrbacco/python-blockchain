@@ -80,6 +80,19 @@ signature are sent to the node
         </div>
         <p class="mono secret" id="wallet-secret" hidden></p>
         <p class="hint warn">The key is stored in this browser's local storage. Back it up: if it is lost, your proofs can no longer be revoked.</p>
+
+        <h3 class="subhead">Public identity</h3>
+        <p class="hint">Without an identity, verifiers only see your address. Add your name, and a website domain that can vouch for it.</p>
+        <div id="identity-current"></div>
+        <form id="identity-form">
+          <label class="field">Name <input type="text" id="identity-name" maxlength="100" placeholder="e.g. Mario Rossi or ACME University" required></label>
+          <label class="field">Domain <input type="text" id="identity-domain" maxlength="253" placeholder="optional, e.g. example.com" spellcheck="false" autocapitalize="off"></label>
+          <button type="submit" class="secondary" id="identity-btn">Publish identity</button>
+        </form>
+        <div id="identity-howto" hidden>
+          <p class="hint">To get the verified badge, publish this file at <code id="identity-url"></code>:</p>
+          <pre class="mono snippet" id="identity-snippet"></pre>
+        </div>
       </div>
     </section>
 
@@ -92,8 +105,15 @@ signature are sent to the node
           <span class="drop-text" id="register-drop-text">Choose the original file</span>
         </label>
         <p class="mono hash-line" id="register-hash"></p>
+        <p class="mono hash-line" id="register-phash"></p>
         <label class="field">Title <input type="text" id="register-title" maxlength="200" placeholder="optional"></label>
         <label class="field">Note <input type="text" id="register-note" maxlength="500" placeholder="optional"></label>
+        <label class="field">Derived from
+          <select id="register-derived">
+            <option value="">— none: this is an original —</option>
+          </select>
+        </label>
+        <p class="hint">Tip: register your unpublished original (e.g. the RAW photo) first, then register the version you publish as derived from it. A thief can claim the public copy, but never the original.</p>
         <label class="check"><input type="checkbox" id="register-mine" checked> Mine a block right away</label>
         <button type="submit" id="register-btn" disabled>Sign &amp; register</button>
       </form>

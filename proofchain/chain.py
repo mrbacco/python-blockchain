@@ -3,8 +3,9 @@
 # date:     2026-10-07
 # filename: proofchain/chain.py
 #
-# the ledger: list of blocks, the proof registry
-# derived from them, the mempool of pending
+# the ledger: list of blocks, the state derived
+# from them (proof registry with disputes, and
+# identities), the mempool of pending
 # transactions, full validation, longest-valid-
 # chain consensus and JSON persistence
 ##################################################
@@ -12,16 +13,28 @@
 import json
 import os
 import threading
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from proofchain.block import MAX_MINER_LENGTH, MAX_TXS_PER_BLOCK, Block, merkle_root
-from proofchain.transaction import REGISTER, REVOKE, Transaction
+from proofchain.perceptual import hamming_distance
+from proofchain.transaction import DISPUTE, IDENTITY, REGISTER, REVOKE, Transaction
 from proofchain.utils import ValidationError, is_hex_digest, now_ms
 
 DEFAULT_DIFFICULTY = 4
 MAX_FUTURE_DRIFT_MS = 2 * 60 * 60 * 1000  # blocks may not be dated more than 2h ahead
 PENDING = -1  # block_index used for records that only exist in the mempool
+
+
+@dataclass(frozen=True)
+class DisputeRecord():
+    disputer: str
+    reason: str
+    timestamp: int
+    tx_id: str
+    block_index: int
+    evidence: str | None = None
+    evidence_timestamp: int | None = None  # when the disputer registered their evidence
 
 
 @dataclass(frozen=True)
@@ -33,20 +46,67 @@ class ProofRecord():
     timestamp: int
     tx_id: str
     block_index: int
+    perceptual_hash: str | None = None
+    derived_from: str | None = None
     revoked: bool = False
     revoked_at: int | None = None
     revoke_tx_id: str | None = None
+    disputes: tuple[DisputeRecord, ...] = ()
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
-def apply_transaction(registry: dict, tx: Transaction, block_index: int) -> None:
-    # state-transition rules; mutates `registry` (records themselves are immutable)
+@dataclass(frozen=True)
+class IdentityRecord():
+    address: str
+    public_key: str
+    name: str
+    domain: str | None
+    timestamp: int
+    tx_id: str
+    block_index: int
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class LedgerState():
+    # records are immutable, so copying the dicts is enough to branch the state
+    registry: dict[str, ProofRecord] = field(default_factory=dict)
+    identities: dict[str, IdentityRecord] = field(default_factory=dict)
+
+    def copy(self) -> "LedgerState":
+        return LedgerState(dict(self.registry), dict(self.identities))
+
+
+def apply_transaction(state: LedgerState, tx: Transaction, block_index: int) -> None:
+    # state-transition rules; mutates `state`
+    if tx.tx_type == IDENTITY:
+        # an address may update its identity at any time; the latest one counts
+        state.identities[tx.owner] = IdentityRecord(
+            address=tx.owner,
+            public_key=tx.public_key,
+            name=tx.metadata["name"],
+            domain=tx.metadata.get("domain"),
+            timestamp=tx.timestamp,
+            tx_id=tx.tx_id,
+            block_index=block_index,
+        )
+        return
+
+    registry = state.registry
     existing = registry.get(tx.content_hash)
     if tx.tx_type == REGISTER:
         if existing is not None and not existing.revoked:
             raise ValidationError(f"content {tx.content_hash} is already registered by {existing.owner}")
+        if tx.derived_from is not None:
+            original = registry.get(tx.derived_from)
+            if original is None or original.revoked:
+                raise ValidationError(f"derived_from {tx.derived_from} is not an active registration")
+            if original.owner != tx.owner:
+                raise ValidationError("derived_from must reference one of your own registrations")
         registry[tx.content_hash] = ProofRecord(
             content_hash=tx.content_hash,
             owner=tx.owner,
@@ -55,6 +115,8 @@ def apply_transaction(registry: dict, tx: Transaction, block_index: int) -> None
             timestamp=tx.timestamp,
             tx_id=tx.tx_id,
             block_index=block_index,
+            perceptual_hash=tx.perceptual_hash,
+            derived_from=tx.derived_from,
         )
     elif tx.tx_type == REVOKE:
         if existing is None:
@@ -64,6 +126,29 @@ def apply_transaction(registry: dict, tx: Transaction, block_index: int) -> None
         if existing.owner != tx.owner:
             raise ValidationError("only the owner can revoke a proof")
         registry[tx.content_hash] = replace(existing, revoked=True, revoked_at=tx.timestamp, revoke_tx_id=tx.tx_id)
+    elif tx.tx_type == DISPUTE:
+        if existing is None or existing.revoked:
+            raise ValidationError(f"content {tx.content_hash} has no active registration to dispute")
+        if existing.owner == tx.owner:
+            raise ValidationError("you cannot dispute your own proof")
+        if any(dispute.disputer == tx.owner for dispute in existing.disputes):
+            raise ValidationError("you have already disputed this proof")
+        evidence_timestamp = None
+        if tx.evidence is not None:
+            evidence = registry.get(tx.evidence)
+            if evidence is None or evidence.owner != tx.owner:
+                raise ValidationError("evidence must be one of your own registrations")
+            evidence_timestamp = evidence.timestamp
+        dispute = DisputeRecord(
+            disputer=tx.owner,
+            reason=tx.metadata["reason"],
+            timestamp=tx.timestamp,
+            tx_id=tx.tx_id,
+            block_index=block_index,
+            evidence=tx.evidence,
+            evidence_timestamp=evidence_timestamp,
+        )
+        registry[tx.content_hash] = replace(existing, disputes=existing.disputes + (dispute,))
     else:
         raise ValidationError(f"unknown tx_type: {tx.tx_type!r}")
 
@@ -74,7 +159,7 @@ class Blockchain():
         self.storage_path = Path(storage_path) if storage_path else None
         self._lock = threading.RLock()
         self.blocks: list[Block] = [Block.genesis()]
-        self.registry: dict[str, ProofRecord] = {}
+        self.state = LedgerState()
         self.mempool: dict[str, Transaction] = {}
         self._tx_ids: set[str] = set()
         if self.storage_path and self.storage_path.exists():
@@ -88,6 +173,10 @@ class Blockchain():
     def height(self) -> int:
         return len(self.blocks)
 
+    @property
+    def registry(self) -> dict[str, ProofRecord]:
+        return self.state.registry
+
     # ---------------------------------------------------------------- mempool
 
     def add_transaction(self, tx: Transaction) -> bool:
@@ -100,8 +189,8 @@ class Blockchain():
             self.mempool[tx.tx_id] = tx
             return True
 
-    def _pending_state(self) -> dict:
-        state = dict(self.registry)
+    def _pending_state(self) -> LedgerState:
+        state = self.state.copy()
         for pending in self.mempool.values():
             apply_transaction(state, pending, PENDING)
         return state
@@ -109,7 +198,7 @@ class Blockchain():
     def _rebuild_mempool(self, candidates: list[Transaction]) -> None:
         # keeps only candidates that are still valid on top of the current chain
         self.mempool = {}
-        state = dict(self.registry)
+        state = self.state.copy()
         for tx in candidates:
             if tx.tx_id in self._tx_ids or tx.tx_id in self.mempool:
                 continue
@@ -145,7 +234,7 @@ class Blockchain():
 
     # ------------------------------------------------------------- validation
 
-    def _validate_block(self, block: Block, prev: Block, registry: dict, seen_tx_ids: set) -> tuple[dict, set]:
+    def _validate_block(self, block: Block, prev: Block, base: LedgerState, seen_tx_ids: set) -> tuple[LedgerState, set]:
         if block.index != prev.index + 1:
             raise ValidationError(f"expected block index {prev.index + 1}, got {block.index}")
         if block.prev_hash != prev.hash:
@@ -165,7 +254,7 @@ class Blockchain():
         if len(block.transactions) > MAX_TXS_PER_BLOCK:
             raise ValidationError(f"block #{block.index} has too many transactions")
 
-        state = dict(registry)
+        state = base.copy()
         block_tx_ids = set()
         for tx in block.transactions:
             tx.validate()
@@ -175,15 +264,15 @@ class Blockchain():
             apply_transaction(state, tx, block.index)
         return state, block_tx_ids
 
-    def _replay(self, blocks: list[Block]) -> tuple[dict, set]:
+    def _replay(self, blocks: list[Block]) -> tuple[LedgerState, set]:
         # validates a whole chain from genesis and returns its derived state
         if not blocks or blocks[0].to_dict() != Block.genesis().to_dict():
             raise ValidationError("chain does not start with the ProofChain genesis block")
-        registry, tx_ids = {}, set()
+        state, tx_ids = LedgerState(), set()
         for prev, block in zip(blocks, blocks[1:]):
-            registry, block_tx_ids = self._validate_block(block, prev, registry, tx_ids)
+            state, block_tx_ids = self._validate_block(block, prev, state, tx_ids)
             tx_ids |= block_tx_ids
-        return registry, tx_ids
+        return state, tx_ids
 
     def is_valid(self) -> bool:
         with self._lock:
@@ -197,7 +286,7 @@ class Blockchain():
 
     def add_block(self, block: Block) -> None:
         with self._lock:
-            self.registry, block_tx_ids = self._validate_block(block, self.tip, self.registry, self._tx_ids)
+            self.state, block_tx_ids = self._validate_block(block, self.tip, self.state, self._tx_ids)
             self.blocks.append(block)
             self._tx_ids |= block_tx_ids
             self._rebuild_mempool(list(self.mempool.values()))
@@ -209,12 +298,12 @@ class Blockchain():
             if len(blocks) <= self.height:
                 return False
             try:
-                registry, tx_ids = self._replay(blocks)
+                state, tx_ids = self._replay(blocks)
             except ValidationError:
                 return False
             # transactions from our abandoned blocks go back to the mempool
             orphaned = [tx for block in self.blocks[1:] for tx in block.transactions if tx.tx_id not in tx_ids]
-            self.blocks, self.registry, self._tx_ids = list(blocks), registry, tx_ids
+            self.blocks, self.state, self._tx_ids = list(blocks), state, tx_ids
             self._rebuild_mempool(orphaned + list(self.mempool.values()))
             self.save()
             return True
@@ -231,7 +320,7 @@ class Blockchain():
             record = self.registry.get(content_hash)
             if record is not None:
                 return ("revoked" if record.revoked else "confirmed"), record
-            pending = self._pending_state().get(content_hash)
+            pending = self._pending_state().registry.get(content_hash)
         if pending is not None:
             return "pending", pending
         return None
@@ -239,6 +328,17 @@ class Blockchain():
     def proofs_by_owner(self, address: str) -> list[ProofRecord]:
         with self._lock:
             return [record for record in self.registry.values() if record.owner == address]
+
+    def identity(self, address: str) -> IdentityRecord | None:
+        with self._lock:
+            return self.state.identities.get(address)
+
+    def similar(self, perceptual_hash: str, max_distance: int = 10) -> list[tuple[int, ProofRecord]]:
+        # registrations whose image dHash is within `max_distance` bits, closest first
+        with self._lock:
+            candidates = [record for record in self.registry.values() if record.perceptual_hash]
+        matches = [(hamming_distance(perceptual_hash, record.perceptual_hash), record) for record in candidates]
+        return sorted(((d, r) for d, r in matches if d <= max_distance), key=lambda item: (item[0], item[1].timestamp))
 
     # ------------------------------------------------------------ persistence
 
@@ -263,6 +363,6 @@ class Blockchain():
         data = json.loads(self.storage_path.read_text(encoding="utf-8"))
         blocks = [Block.from_dict(block) for block in data["blocks"]]
         with self._lock:
-            self.registry, self._tx_ids = self._replay(blocks)
+            self.state, self._tx_ids = self._replay(blocks)
             self.blocks = blocks
             self.mempool = {}
